@@ -1068,6 +1068,104 @@ function slugifyKey(name){
   return s || ('p'+Math.random().toString(36).slice(2,8));
 }
 
+/* ===== Student session persistence + presence (rejoin after the app is closed/restarted) ===== */
+const ST_SESSION_KEY = 'st_student_session';
+function getDeviceId(){
+  try{
+    let id = localStorage.getItem('st_device_id');
+    if(!id){ id = genId()+genId(); localStorage.setItem('st_device_id', id); }
+    return id;
+  }catch(e){ return window._stDev || (window._stDev = genId()+genId()); }
+}
+function saveStudentSession(){
+  if(!state.code || !state.playerKey || state.isTeacher || state.isAdminJoin) return;
+  try{
+    localStorage.setItem(ST_SESSION_KEY, JSON.stringify({
+      code: state.code, key: state.playerKey, name: state.playerName, category: state.category, ts: Date.now()
+    }));
+  }catch(e){}
+}
+function loadStudentSession(){
+  try{ const raw = localStorage.getItem(ST_SESSION_KEY); return raw ? JSON.parse(raw) : null; }catch(e){ return null; }
+}
+function clearStudentSession(){ try{ localStorage.removeItem(ST_SESSION_KEY); }catch(e){} }
+
+/* Presence: marks the student online/offline so a restarted app (or a different phone) can
+   take the same name back, while someone who is really connected can't be impersonated. */
+const presence = { ref:null, conn:null, handler:null };
+function startPresence(){
+  stopPresence(false);
+  if(!db || !state.code || !state.playerKey) return;
+  const pref = db.ref(`rooms/${state.code}/players/${state.playerKey}`);
+  const conn = db.ref('.info/connected');
+  presence.ref = pref; presence.conn = conn;
+  presence.handler = conn.on('value', snap=>{
+    if(snap.val()!==true) return;
+    pref.once('value').then(s=>{
+      if(!s.exists() || presence.ref!==pref) return;      // record was removed — don't recreate it
+      pref.update({ online:true, deviceId:getDeviceId(), lastSeen:Date.now() }).catch(()=>{});
+      pref.child('online').onDisconnect().set(false).catch(()=>{});
+      pref.child('lastSeen').onDisconnect().set(firebase.database.ServerValue.TIMESTAMP).catch(()=>{});
+    }).catch(()=>{});
+  });
+}
+function stopPresence(markOffline){
+  const pref = presence.ref, conn = presence.conn, handler = presence.handler;
+  presence.ref = presence.conn = presence.handler = null;
+  if(conn && handler){ try{ conn.off('value', handler); }catch(e){} }
+  if(pref){
+    try{ pref.child('online').onDisconnect().cancel(); pref.child('lastSeen').onDisconnect().cancel(); }catch(e){}
+    if(markOffline){ pref.child('online').set(false).catch(()=>{}); }
+  }
+}
+
+/* Reset a returning student's record (same rules as the anti-cheat restart) and mark them online again. */
+async function applyRejoin(room, key){
+  const base = { deviceId:getDeviceId(), online:true, lastSeen:Date.now() };
+  const playing = room.status==='playing';
+  try{
+    if(isOral(room.category)){
+      if(playing){ state.currentRoom = room; await oralOnLeave(); }
+      await db.ref(`rooms/${state.code}/players/${key}`).update(base);
+    } else if(playing){
+      await db.ref(`rooms/${state.code}/players/${key}`).update(Object.assign({
+        score:0, progress:0, status:null, correctAnswers:0, wrongAnswers:0, questionsAnswered:0,
+        questionsRemaining:(room.questions||[]).length, challengesTriggered:0, challengesCompleted:0,
+        answerLog:null, tttBoard:null, lastAction:null, finishedAt:null,
+        restarts: firebase.database.ServerValue.increment(1), lastLeftAt: Date.now()
+      }, base));
+    } else {
+      await db.ref(`rooms/${state.code}/players/${key}`).update(base);
+    }
+  }catch(e){ console.error(e); }
+}
+/* Put a (re)joined student on the right screen: waiting room, or straight back into a running game. */
+function enterJoinedRoom(room, rejoin){
+  document.getElementById('student-name-display').textContent = state.playerName;
+  document.getElementById('student-code-display').textContent = state.code;
+  state.currentRoom = room; state._enteredPlay = false;
+  attachRoomListener(state.code);
+  startPresence();
+  saveStudentSession();
+  if(room.status==='playing'){ enterPlay(room, { shuffle: !!rejoin }); }
+  else { go('student-waiting'); renderStudentPlayersFromRoom(room); }
+}
+/* On app launch: if the student was in a game that's still alive, drop them back in. */
+async function tryResumeStudent(){
+  const s = loadStudentSession();
+  if(!s || !s.code || !s.key) return;
+  if(Date.now() - (s.ts||0) > 6*60*60*1000){ clearStudentSession(); return; }
+  try{
+    const room = await fetchRoomOnce(s.code);
+    if(!room || room.status==='finished' || !room.players || !room.players[s.key]){ clearStudentSession(); return; }
+    state.role='student'; state.isTeacher=false;
+    state.code=s.code; state.playerKey=s.key; state.playerName=(room.players[s.key].name)||s.name; state.category=room.category;
+    await applyRejoin(room, s.key);
+    enterJoinedRoom(room, true);
+    toast(room.status==='playing' ? 'Welcome back! Your game restarted from the first question.' : 'Welcome back! You are still in the game.');
+  }catch(e){ console.error(e); }
+}
+
 /* ===== Live room listener ===== */
 let roomListenerRef = null;
 function attachRoomListener(code){
@@ -1083,7 +1181,8 @@ function detachRoomListener(){
   if(roomListenerRef){ roomListenerRef.off(); roomListenerRef=null; }
 }
 function onRoomUpdate(room){
-  if(!room) return;
+  if(!room){ if(!state.isTeacher && state.playerKey) clearStudentSession(); return; }
+  if(room.status==='finished' && !state.isTeacher) clearStudentSession();
   const activeEl = document.querySelector('.screen.active');
   const activeId = activeEl ? activeEl.id : '';
   if(activeId==='screen-teacher-waiting') renderTeacherPlayersFromRoom(room);
@@ -2123,14 +2222,30 @@ async function submitJoin(){
     if(room.status==='finished'){err.textContent='This game has already ended.';err.classList.add('show');return}
     const key = slugifyKey(name);
     const players = room.players||{};
-    if(players[key]){err.textContent='That name is already taken.';err.classList.add('show');return}
+    const existing = players[key];
+    if(existing){
+      // Same phone (or the old session is offline / legacy record) => this is a student coming BACK, let them in.
+      const sameDevice = !!existing.deviceId && existing.deviceId===getDeviceId();
+      const free = existing.online===false || !existing.deviceId;
+      if(!(sameDevice || free)){
+        err.textContent='That name is in use on another phone right now. If it is you, wait a few seconds and try again.';
+        err.classList.add('show');return;
+      }
+      state.code=code;state.playerName=existing.name||name;state.playerKey=key;state.category=room.category;
+      await applyRejoin(room, key);
+      room.players = Object.assign({}, players, {[key]: Object.assign({}, existing, {online:true})});
+      enterJoinedRoom(room, true);
+      toast(room.status==='playing' ? 'Welcome back! Your game restarted from the first question.' : 'Welcome back!');
+      return;
+    }
     const playerRecord = {
       name,joinedAt:Date.now(),score:0,progress:0,status:null,
       correctAnswers:0,wrongAnswers:0,questionsAnswered:0,
       questionsRemaining:(room.questions||[]).length,
       challengesTriggered:0,challengesCompleted:0,
       currentQuestion:0,lastAction:null,lastActionAt:Date.now(),finishedAt:null,
-      adminPlayer: !!state.isAdminJoin
+      adminPlayer: !!state.isAdminJoin,
+      deviceId:getDeviceId(), online:true
     };
     await db.ref(`rooms/${code}/players/${key}`).set(playerRecord);
     state.code=code;state.playerName=name;state.playerKey=key;state.category=room.category;
@@ -2141,6 +2256,8 @@ async function submitJoin(){
     go('student-waiting');
     renderStudentPlayersFromRoom(room);
     attachRoomListener(code);
+    startPresence();
+    saveStudentSession();
   }catch(e){
     console.error(e);
     err.textContent='Connection problem — please try again.';err.classList.add('show');
@@ -2161,6 +2278,8 @@ function renderStudentPlayersFromRoom(room){
 }
 
 function leaveWaitingRoom(){
+  stopPresence(false);
+  clearStudentSession();
   if(state.code && state.playerKey && db){
     db.ref(`rooms/${state.code}/players/${state.playerKey}`).remove().catch(()=>{});
   }
@@ -4202,6 +4321,8 @@ function acReset(){
 <script>
 /* resetAll + init */
 function resetAll(){
+  stopPresence(true);
+  clearStudentSession();
   if(state.timer) clearInterval(state.timer);
   oralStopTicker();
   acReset();
@@ -4243,6 +4364,7 @@ document.addEventListener('DOMContentLoaded',()=>{
   initServerClock();
   acInit();
   restoreTeacherSession();
+  tryResumeStudent();
   const inp=document.getElementById('in-join-code');
   if(inp) inp.addEventListener('input',()=>{inp.value=inp.value.toUpperCase().replace(/[^A-Z0-9]/g,'')});
   const nameInp=document.getElementById('in-join-name');
